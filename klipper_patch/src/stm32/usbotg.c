@@ -1,0 +1,731 @@
+// Hardware interface to "USB OTG (on the go) controller" on stm32
+//
+// Copyright (C) 2019-2025  Kevin O'Connor <kevin@koconnor.net>
+//
+// This file may be distributed under the terms of the GNU GPLv3 license.
+
+#include <string.h> // NULL
+#include "autoconf.h" // CONFIG_MACH_STM32F446
+#include "board/armcm_boot.h" // armcm_enable_irq
+#include "board/io.h" // writel
+#include "board/usb_cdc.h" // usb_notify_ep0
+#include "board/usb_cdc_ep.h" // USB_CDC_EP_BULK_IN
+#include "command.h" // DECL_CONSTANT_STR
+#include "generic/armcm_timer.h" // udelay
+#include "internal.h" // GPIO
+#include "sched.h" // DECL_INIT
+
+#if CONFIG_STM32_USB_PB14_PB15
+  #define IS_OTG_HS 1
+  #define GPIO_D_NEG GPIO('B', 14)
+  #define GPIO_D_POS GPIO('B', 15)
+  #define GPIO_FUNC GPIO_FUNCTION(12)
+  DECL_CONSTANT_STR("RESERVE_PINS_USB1", "PB14,PB15");
+#else
+  #if CONFIG_MACH_STM32H723
+    #define IS_OTG_HS 1
+  #else
+    #define IS_OTG_HS 0
+  #endif
+  #define GPIO_D_NEG GPIO('A', 11)
+  #define GPIO_D_POS GPIO('A', 12)
+  #define GPIO_FUNC GPIO_FUNCTION(10)
+  DECL_CONSTANT_STR("RESERVE_PINS_USB", "PA11,PA12");
+#endif
+
+#if IS_OTG_HS
+  #define USB_PERIPH_BASE USB_OTG_HS_PERIPH_BASE
+  #define OTG_IRQn OTG_HS_IRQn
+  #define USBOTGEN RCC_AHB1ENR_USB1OTGHSEN
+#else
+  #define USB_PERIPH_BASE USB_OTG_FS_PERIPH_BASE
+  #define OTG_IRQn OTG_FS_IRQn
+  #define USBOTGEN RCC_AHB1ENR_USB2OTGHSEN
+#endif
+
+static void
+usb_irq_disable(void)
+{
+    NVIC_DisableIRQ(OTG_IRQn);
+}
+
+static void
+usb_irq_enable(void)
+{
+    NVIC_EnableIRQ(OTG_IRQn);
+}
+
+
+/****************************************************************
+ * USB transfer memory
+ ****************************************************************/
+
+#define OTG ((USB_OTG_GlobalTypeDef*)USB_PERIPH_BASE)
+#define OTGD ((USB_OTG_DeviceTypeDef*)(USB_PERIPH_BASE + USB_OTG_DEVICE_BASE))
+#define EPFIFO(EP) ((void*)(USB_PERIPH_BASE + USB_OTG_FIFO_BASE + ((EP) << 12)))
+#define EPIN(EP) ((USB_OTG_INEndpointTypeDef*)                          \
+                  (USB_PERIPH_BASE + USB_OTG_IN_ENDPOINT_BASE + ((EP) << 5)))
+#define EPOUT(EP) ((USB_OTG_OUTEndpointTypeDef*)                        \
+                   (USB_PERIPH_BASE + USB_OTG_OUT_ENDPOINT_BASE + ((EP) << 5)))
+
+#if CONFIG_STM32F4_GD32_USB_INIT_WORKAROUND
+#define USB_PWRCLKCTL (*(volatile uint32_t *)(USB_PERIPH_BASE + 0x0E00))
+#define USB_PWRCLKCTL_SHCLK (1 << 1)
+#define USB_PWRCLKCTL_SUCLK (1 << 0)
+
+static void
+usb_core_soft_reset(void)
+{
+    while (!(OTG->GRSTCTL & USB_OTG_GRSTCTL_AHBIDL))
+        ;
+    OTG->GRSTCTL |= USB_OTG_GRSTCTL_CSRST;
+    while (OTG->GRSTCTL & USB_OTG_GRSTCTL_CSRST)
+        ;
+    udelay(3);
+}
+
+static void
+usb_core_runtime_reset(void)
+{
+    // Flush all TX FIFOs then RX FIFO after bootloader handoff.
+    OTG->GRSTCTL = (USB_OTG_GRSTCTL_TXFFLSH
+                    | (0x10 << USB_OTG_GRSTCTL_TXFNUM_Pos));
+    while (OTG->GRSTCTL & USB_OTG_GRSTCTL_TXFFLSH)
+        ;
+    udelay(3);
+    OTG->GRSTCTL = USB_OTG_GRSTCTL_RXFFLSH;
+    while (OTG->GRSTCTL & USB_OTG_GRSTCTL_RXFFLSH)
+        ;
+    udelay(3);
+
+    // Clear endpoint runtime state that may persist from the bootloader.
+    int i;
+    for (i = 0; i < 4; i++) {
+        USB_OTG_INEndpointTypeDef *ei = EPIN(i);
+        USB_OTG_OUTEndpointTypeDef *eo = EPOUT(i);
+
+        if (ei->DIEPCTL & USB_OTG_DIEPCTL_EPENA)
+            ei->DIEPCTL = USB_OTG_DIEPCTL_EPDIS | USB_OTG_DIEPCTL_SNAK;
+        else
+            ei->DIEPCTL = 0;
+        ei->DIEPTSIZ = 0;
+        ei->DIEPINT = 0xFFFFFFFF;
+
+        if (eo->DOEPCTL & USB_OTG_DOEPCTL_EPENA)
+            eo->DOEPCTL = USB_OTG_DOEPCTL_EPDIS | USB_OTG_DOEPCTL_SNAK;
+        else
+            eo->DOEPCTL = 0;
+        eo->DOEPTSIZ = 0;
+        eo->DOEPINT = 0xFFFFFFFF;
+    }
+
+    OTGD->DIEPEMPMSK = 0;
+    OTGD->DAINTMSK = 0;
+    OTGD->DAINT = 0xFFFFFFFF;
+    OTG->GOTGINT = 0xFFFFFFFF;
+    OTG->GINTSTS = 0xBFFFFFFF;
+}
+#endif
+
+// Setup the USB fifos
+static void
+fifo_configure(void)
+{
+    // Reserve memory for Rx fifo
+    uint32_t sz = ((4 * 1 + 6)
+                   + 4 * ((USB_CDC_EP_BULK_OUT_SIZE / 4) + 1)
+                   + (2 * 1));
+    OTG->GRXFSIZ = sz;
+
+    // Tx fifos
+    uint32_t fpos = sz, ep_size = 0x10;
+    OTG->DIEPTXF0_HNPTXFSIZ = ((fpos << USB_OTG_TX0FSA_Pos)
+                               | (ep_size << USB_OTG_TX0FD_Pos));
+    fpos += ep_size;
+
+    OTG->DIEPTXF[USB_CDC_EP_ACM - 1] = (
+        (fpos << USB_OTG_DIEPTXF_INEPTXSA_Pos)
+        | (ep_size << USB_OTG_DIEPTXF_INEPTXFD_Pos));
+    fpos += ep_size;
+
+    OTG->DIEPTXF[USB_CDC_EP_BULK_IN - 1] = (
+        (fpos << USB_OTG_DIEPTXF_INEPTXSA_Pos)
+        | (ep_size << USB_OTG_DIEPTXF_INEPTXFD_Pos));
+    fpos += ep_size;
+}
+
+// Write a packet to a tx fifo
+static int_fast8_t
+fifo_write_packet(uint32_t ep, const uint8_t *src, uint32_t len)
+{
+    void *fifo = EPFIFO(ep);
+    USB_OTG_INEndpointTypeDef *epi = EPIN(ep);
+    epi->DIEPINT = USB_OTG_DIEPINT_XFRC;
+    epi->DIEPTSIZ = len | (1 << USB_OTG_DIEPTSIZ_PKTCNT_Pos);
+    epi->DIEPCTL |= USB_OTG_DIEPCTL_EPENA | USB_OTG_DIEPCTL_CNAK;
+    int32_t count = len;
+    while (count >= 4) {
+        uint32_t data;
+        memcpy(&data, src, 4);
+        writel(fifo, data);
+        count -= 4;
+        src += 4;
+    }
+    if (count) {
+        uint32_t data = 0;
+        memcpy(&data, src, count);
+        writel(fifo, data);
+    }
+    return len;
+}
+
+// Write a packet to a tx fifo (optimized for already aligned data)
+static int
+fifo_write_packet_fast(uint32_t ep, const uint32_t *src, uint32_t len)
+{
+    void *fifo = EPFIFO(ep);
+    USB_OTG_INEndpointTypeDef *epi = EPIN(ep);
+    uint32_t ctl = epi->DIEPCTL;
+    if (ctl & USB_OTG_DIEPCTL_EPENA)
+        return -1;
+    epi->DIEPINT = USB_OTG_DIEPINT_XFRC;
+    epi->DIEPTSIZ = len | (1 << USB_OTG_DIEPTSIZ_PKTCNT_Pos);
+    epi->DIEPCTL = ctl | USB_OTG_DIEPCTL_EPENA | USB_OTG_DIEPCTL_CNAK;
+    uint32_t i;
+    for (i=0; i < DIV_ROUND_UP(len, sizeof(uint32_t)); i++)
+        writel(fifo, src[i]);
+    return 0;
+}
+
+// Read a packet from the rx queue
+static int_fast8_t
+fifo_read_packet(uint8_t *dest, uint_fast8_t max_len)
+{
+    // Transfer data
+    void *fifo = EPFIFO(0);
+    uint32_t grx = OTG->GRXSTSP;
+    uint32_t bcnt = (grx & USB_OTG_GRXSTSP_BCNT) >> USB_OTG_GRXSTSP_BCNT_Pos;
+    uint32_t xfer = bcnt > max_len ? max_len : bcnt, count = xfer;
+    while (count >= 4) {
+        uint32_t data = readl(fifo);
+        memcpy(dest, &data, 4);
+        count -= 4;
+        dest += 4;
+    }
+    if (count) {
+        uint32_t data = readl(fifo);
+        memcpy(dest, &data, count);
+    }
+    uint32_t extra = DIV_ROUND_UP(bcnt, 4) - DIV_ROUND_UP(xfer, 4);
+    while (extra--)
+        readl(fifo);
+    return xfer;
+}
+
+// Reenable packet reception if it got disabled by controller
+static void
+enable_rx_endpoint(uint32_t ep)
+{
+    USB_OTG_OUTEndpointTypeDef *epo = EPOUT(ep);
+    uint32_t ctl = epo->DOEPCTL;
+    if (!(ctl & USB_OTG_DOEPCTL_EPENA) || ctl & USB_OTG_DOEPCTL_NAKSTS) {
+#if CONFIG_STM32F4_GD32_USB_INIT_WORKAROUND
+        if (ep == 0) {
+            // Keep EP0 setup buffering enabled on GD32 after each control phase.
+            epo->DOEPTSIZ = (64 | (3 << USB_OTG_DOEPTSIZ_STUPCNT_Pos)
+                             | (1 << USB_OTG_DOEPTSIZ_PKTCNT_Pos));
+        } else {
+            epo->DOEPTSIZ = 64 | (1 << USB_OTG_DOEPTSIZ_PKTCNT_Pos);
+        }
+#else
+        epo->DOEPTSIZ = 64 | (1 << USB_OTG_DOEPTSIZ_PKTCNT_Pos);
+#endif
+        epo->DOEPCTL = ctl | USB_OTG_DOEPCTL_EPENA | USB_OTG_DOEPCTL_CNAK;
+    }
+}
+
+#if CONFIG_STM32F4_GD32_USB_INIT_WORKAROUND
+// Stage one bulk-OUT packet in irq context so host->MCU writes don't stall.
+static uint8_t gd32_bulk_out_buf[USB_CDC_EP_BULK_OUT_SIZE];
+static volatile uint8_t gd32_bulk_out_len, gd32_bulk_out_ready;
+
+// IRQ path counters for diagnosing which interrupt delivers bulk OUT packets.
+// Read via debug_read order=2 from host after sending one bulk OUT write.
+static volatile uint32_t gd32_rxflvl_bulk_count;  // RXFLVL fired w/ pktsts==2
+static volatile uint32_t gd32_oepint_bulk_count;  // OEPINT fired for bulk OUT
+static volatile uint32_t gd32_notify_bulk_count;  // usb_notify_bulk_out() calls
+
+static int
+gd32_stage_bulk_out_packet(void)
+{
+    uint32_t grx = OTG->GRXSTSR;
+    uint32_t ep = grx & USB_OTG_GRXSTSP_EPNUM_Msk;
+    if (ep != USB_CDC_EP_BULK_OUT)
+        return 0;
+    uint32_t pktsts = ((grx & USB_OTG_GRXSTSP_PKTSTS_Msk)
+                       >> USB_OTG_GRXSTSP_PKTSTS_Pos);
+    if (pktsts != 2)
+        return 0;
+    gd32_rxflvl_bulk_count++;
+    if (!gd32_bulk_out_ready) {
+        gd32_bulk_out_len = fifo_read_packet(gd32_bulk_out_buf
+                                             , sizeof(gd32_bulk_out_buf));
+        gd32_bulk_out_ready = 1;
+    } else {
+        // Drop packet if userspace hasn't consumed prior staged payload yet.
+        fifo_read_packet(NULL, 0);
+    }
+    enable_rx_endpoint(USB_CDC_EP_BULK_OUT);
+    gd32_notify_bulk_count++;
+    usb_notify_bulk_out();
+    return 1;
+}
+#endif
+
+// Inspect the next packet on the rx queue
+static uint32_t
+peek_rx_queue(uint32_t ep)
+{
+    for (;;) {
+        uint32_t sts = OTG->GINTSTS;
+        if (!(sts & USB_OTG_GINTSTS_RXFLVL))
+            // No packet ready
+            return 0;
+        uint32_t grx = OTG->GRXSTSR, grx_ep = grx & USB_OTG_GRXSTSP_EPNUM_Msk;
+        uint32_t pktsts = ((grx & USB_OTG_GRXSTSP_PKTSTS_Msk)
+                           >> USB_OTG_GRXSTSP_PKTSTS_Pos);
+        if ((grx_ep == 0 || grx_ep == USB_CDC_EP_BULK_OUT)
+            && (pktsts == 2 || pktsts == 4 || pktsts == 6)) {
+            // A packet is ready
+            if (grx_ep != ep)
+                return 0;
+            return grx;
+        }
+        if ((grx_ep != 0 && grx_ep != USB_CDC_EP_BULK_OUT)
+            || (pktsts != 1 && pktsts != 3 && pktsts != 4)) {
+            // Rx queue has bogus value - just pop it
+            sts = OTG->GRXSTSP;
+            continue;
+        }
+        // Discard informational entries from queue
+        fifo_read_packet(NULL, 0);
+    }
+}
+
+
+/****************************************************************
+ * USB interface
+ ****************************************************************/
+
+int_fast8_t
+usb_read_bulk_out(void *data, uint_fast8_t max_len)
+{
+    usb_irq_disable();
+#if CONFIG_STM32F4_GD32_USB_INIT_WORKAROUND
+    if (gd32_bulk_out_ready) {
+        uint_fast8_t len = gd32_bulk_out_len;
+        if (len > max_len)
+            len = max_len;
+        memcpy(data, gd32_bulk_out_buf, len);
+        gd32_bulk_out_ready = 0;
+        gd32_bulk_out_len = 0;
+        OTG->GINTMSK |= USB_OTG_GINTMSK_RXFLVLM;
+        usb_irq_enable();
+        return len;
+    }
+#endif
+    uint32_t grx = peek_rx_queue(USB_CDC_EP_BULK_OUT);
+    if (!grx) {
+        // Wait for packet
+        OTG->GINTMSK |= USB_OTG_GINTMSK_RXFLVLM;
+        usb_irq_enable();
+        return -1;
+    }
+    int_fast8_t ret = fifo_read_packet(data, max_len);
+    enable_rx_endpoint(USB_CDC_EP_BULK_OUT);
+#if CONFIG_STM32F4_GD32_USB_INIT_WORKAROUND
+    // Keep RX notifications flowing on GD32 after the first bulk packet.
+    OTG->GINTMSK |= USB_OTG_GINTMSK_RXFLVLM;
+#endif
+    usb_irq_enable();
+    return ret;
+}
+
+// Storage for "bulk in" transmissions for a kind of manual "double buffering"
+static struct {
+    uint32_t len;
+    uint32_t buf[USB_CDC_EP_BULK_IN_SIZE / sizeof(uint32_t)];
+} TX_BUF;
+
+int_fast8_t
+usb_send_bulk_in(void *data, uint_fast8_t len)
+{
+    usb_irq_disable();
+    uint32_t ctl = EPIN(USB_CDC_EP_BULK_IN)->DIEPCTL;
+    if (!(ctl & USB_OTG_DIEPCTL_USBAEP)) {
+        // Controller not enabled - discard data
+        usb_irq_enable();
+        return len;
+    }
+    if (ctl & USB_OTG_DIEPCTL_EPENA) {
+        if (!CONFIG_STM32_USB_DOUBLE_BUFFER_TX || TX_BUF.len || !len) {
+            // Wait for space to transmit
+            OTGD->DAINTMSK |= 1 << USB_CDC_EP_BULK_IN;
+            usb_irq_enable();
+            return -1;
+        }
+        // Buffer next packet for transmission from irq handler
+        len = len > USB_CDC_EP_BULK_IN_SIZE ? USB_CDC_EP_BULK_IN_SIZE : len;
+        uint32_t blocks = DIV_ROUND_UP(len, sizeof(uint32_t));
+        TX_BUF.buf[blocks-1] = 0;
+        memcpy(TX_BUF.buf, data, len);
+        TX_BUF.len = len;
+        OTGD->DAINTMSK |= 1 << USB_CDC_EP_BULK_IN;
+        usb_irq_enable();
+        return len;
+    }
+    int_fast8_t ret = fifo_write_packet(USB_CDC_EP_BULK_IN, data, len);
+    usb_irq_enable();
+    return ret;
+}
+
+int_fast8_t
+usb_read_ep0(void *data, uint_fast8_t max_len)
+{
+    usb_irq_disable();
+    uint32_t grx = peek_rx_queue(0);
+    if (!grx) {
+        // Wait for packet
+        OTG->GINTMSK |= USB_OTG_GINTMSK_RXFLVLM;
+        usb_irq_enable();
+        return -1;
+    }
+    uint32_t pktsts = ((grx & USB_OTG_GRXSTSP_PKTSTS_Msk)
+                       >> USB_OTG_GRXSTSP_PKTSTS_Pos);
+    if (pktsts != 2) {
+        // Transfer interrupted
+        usb_irq_enable();
+        return -2;
+    }
+    int_fast8_t ret = fifo_read_packet(data, max_len);
+    enable_rx_endpoint(0);
+#if CONFIG_STM32F4_GD32_USB_INIT_WORKAROUND
+    OTG->GINTMSK |= USB_OTG_GINTMSK_RXFLVLM;
+#endif
+    usb_irq_enable();
+    return ret;
+}
+
+int_fast8_t
+usb_read_ep0_setup(void *data, uint_fast8_t max_len)
+{
+    static uint8_t setup_buf[8];
+    usb_irq_disable();
+    for (;;) {
+        uint32_t grx = peek_rx_queue(0);
+        if (!grx) {
+            // Wait for packet
+            OTG->GINTMSK |= USB_OTG_GINTMSK_RXFLVLM;
+            usb_irq_enable();
+            return -1;
+        }
+        uint32_t pktsts = ((grx & USB_OTG_GRXSTSP_PKTSTS_Msk)
+                           >> USB_OTG_GRXSTSP_PKTSTS_Pos);
+        if (pktsts == 6)
+            // Store setup packet
+            fifo_read_packet(setup_buf, sizeof(setup_buf));
+        else
+            // Discard other packets
+            fifo_read_packet(NULL, 0);
+        if (pktsts == 4)
+            // Setup complete
+            break;
+    }
+    uint32_t ctl = EPIN(0)->DIEPCTL;
+    if (ctl & USB_OTG_DIEPCTL_EPENA) {
+        // Flush any pending tx packets
+        EPIN(0)->DIEPCTL = ctl | USB_OTG_DIEPCTL_EPDIS | USB_OTG_DIEPCTL_SNAK;
+        while (EPIN(0)->DIEPCTL & USB_OTG_DIEPCTL_EPENA)
+            ;
+        OTG->GRSTCTL = USB_OTG_GRSTCTL_TXFFLSH;
+        while (OTG->GRSTCTL & USB_OTG_GRSTCTL_TXFFLSH)
+            ;
+    }
+    enable_rx_endpoint(0);
+    EPOUT(0)->DOEPINT = USB_OTG_DOEPINT_STUP;
+#if CONFIG_STM32F4_GD32_USB_INIT_WORKAROUND
+    OTG->GINTMSK |= USB_OTG_GINTMSK_RXFLVLM;
+#endif
+    usb_irq_enable();
+    // Return previously read setup packet
+    memcpy(data, setup_buf, max_len);
+    return max_len;
+}
+
+int_fast8_t
+usb_send_ep0(const void *data, uint_fast8_t len)
+{
+    usb_irq_disable();
+    uint32_t grx = peek_rx_queue(0);
+    if (grx) {
+        // Transfer interrupted
+        usb_irq_enable();
+        return -2;
+    }
+    if (EPIN(0)->DIEPCTL & USB_OTG_DIEPCTL_EPENA) {
+        // Wait for space to transmit
+        OTG->GINTMSK |= USB_OTG_GINTMSK_RXFLVLM;
+        OTGD->DAINTMSK |= 1 << 0;
+        usb_irq_enable();
+        return -1;
+    }
+    int_fast8_t ret = fifo_write_packet(0, data, len);
+    usb_irq_enable();
+    return ret;
+}
+
+void
+usb_stall_ep0(void)
+{
+    usb_irq_disable();
+    EPIN(0)->DIEPCTL |= USB_OTG_DIEPCTL_STALL;
+    usb_notify_ep0(); // XXX - wake from main usb_cdc.c code?
+    usb_irq_enable();
+}
+
+void
+usb_set_address(uint_fast8_t addr)
+{
+    OTGD->DCFG = ((OTGD->DCFG & ~USB_OTG_DCFG_DAD_Msk)
+                  | (addr << USB_OTG_DCFG_DAD_Pos));
+    usb_send_ep0(NULL, 0);
+    usb_notify_ep0();
+}
+
+void
+usb_set_configure(void)
+{
+    usb_irq_disable();
+#if CONFIG_STM32F4_GD32_USB_INIT_WORKAROUND
+    gd32_bulk_out_ready = 0;
+    gd32_bulk_out_len = 0;
+#endif
+    // Configure and enable USB_CDC_EP_ACM
+    USB_OTG_INEndpointTypeDef *epi = EPIN(USB_CDC_EP_ACM);
+    epi->DIEPTSIZ = (USB_CDC_EP_ACM_SIZE
+                     | (1 << USB_OTG_DIEPTSIZ_PKTCNT_Pos));
+    epi->DIEPCTL = (
+        USB_OTG_DIEPCTL_SNAK | USB_OTG_DIEPCTL_USBAEP
+        | (0x03 << USB_OTG_DIEPCTL_EPTYP_Pos) | USB_OTG_DIEPCTL_SD0PID_SEVNFRM
+        | (USB_CDC_EP_ACM << USB_OTG_DIEPCTL_TXFNUM_Pos)
+        | (USB_CDC_EP_ACM_SIZE << USB_OTG_DIEPCTL_MPSIZ_Pos));
+
+    // Configure and enable USB_CDC_EP_BULK_OUT
+    USB_OTG_OUTEndpointTypeDef *epo = EPOUT(USB_CDC_EP_BULK_OUT);
+    epo->DOEPTSIZ = 64 | (1 << USB_OTG_DOEPTSIZ_PKTCNT_Pos);
+    epo->DOEPCTL = (
+        USB_OTG_DOEPCTL_CNAK | USB_OTG_DOEPCTL_USBAEP | USB_OTG_DOEPCTL_EPENA
+        | (0x02 << USB_OTG_DOEPCTL_EPTYP_Pos) | USB_OTG_DOEPCTL_SD0PID_SEVNFRM
+        | (USB_CDC_EP_BULK_OUT_SIZE << USB_OTG_DOEPCTL_MPSIZ_Pos));
+
+    // Configure and flush USB_CDC_EP_BULK_IN
+    epi = EPIN(USB_CDC_EP_BULK_IN);
+    epi->DIEPTSIZ = (USB_CDC_EP_BULK_IN_SIZE
+                     | (1 << USB_OTG_DIEPTSIZ_PKTCNT_Pos));
+    epi->DIEPCTL = (
+        USB_OTG_DIEPCTL_SNAK | USB_OTG_DIEPCTL_EPDIS | USB_OTG_DIEPCTL_USBAEP
+        | (0x02 << USB_OTG_DIEPCTL_EPTYP_Pos) | USB_OTG_DIEPCTL_SD0PID_SEVNFRM
+        | (USB_CDC_EP_BULK_IN << USB_OTG_DIEPCTL_TXFNUM_Pos)
+        | (USB_CDC_EP_BULK_IN_SIZE << USB_OTG_DIEPCTL_MPSIZ_Pos));
+    while (epi->DIEPCTL & USB_OTG_DIEPCTL_EPENA)
+        ;
+    OTG->GRSTCTL = ((USB_CDC_EP_BULK_IN << USB_OTG_GRSTCTL_TXFNUM_Pos)
+                    | USB_OTG_GRSTCTL_TXFFLSH);
+    while (OTG->GRSTCTL & USB_OTG_GRSTCTL_TXFFLSH)
+        ;
+    if (CONFIG_STM32_USB_DOUBLE_BUFFER_TX)
+        TX_BUF.len = 0;
+    usb_irq_enable();
+}
+
+
+/****************************************************************
+ * Setup and interrupts
+ ****************************************************************/
+
+// Main irq handler
+void
+OTG_FS_IRQHandler(void)
+{
+    uint32_t sts = OTG->GINTSTS;
+    if (sts & USB_OTG_GINTSTS_RXFLVL) {
+#if CONFIG_STM32F4_GD32_USB_INIT_WORKAROUND
+        if (!gd32_stage_bulk_out_packet()) {
+#endif
+        // Received data - disable irq and notify endpoint
+        OTG->GINTMSK &= ~USB_OTG_GINTMSK_RXFLVLM;
+        uint32_t grx = OTG->GRXSTSR, ep = grx & USB_OTG_GRXSTSP_EPNUM_Msk;
+        if (ep == 0)
+            usb_notify_ep0();
+        else
+            usb_notify_bulk_out();
+#if CONFIG_STM32F4_GD32_USB_INIT_WORKAROUND
+        }
+#endif
+    }
+    if (sts & USB_OTG_GINTSTS_IEPINT) {
+        // Can transmit data - disable irq and notify endpoint
+        uint32_t daint = OTGD->DAINT, msk = OTGD->DAINTMSK;
+        uint32_t in_mask = msk & 0x0000FFFF, pend = daint & in_mask;
+        OTGD->DAINTMSK = (msk & ~pend);
+        if (pend & (1 << 0))
+            usb_notify_ep0();
+        if (pend & (1 << USB_CDC_EP_BULK_IN)) {
+            usb_notify_bulk_in();
+            if (CONFIG_STM32_USB_DOUBLE_BUFFER_TX && TX_BUF.len) {
+                int ret = fifo_write_packet_fast(USB_CDC_EP_BULK_IN
+                                                 , TX_BUF.buf, TX_BUF.len);
+                if (!ret)
+                    TX_BUF.len = 0;
+            }
+        }
+    }
+#if CONFIG_STM32F4_GD32_USB_INIT_WORKAROUND
+    if (sts & USB_OTG_GINTSTS_OEPINT) {
+        uint32_t daint = OTGD->DAINT;
+        if (daint & (1 << (16 + USB_CDC_EP_BULK_OUT))) {
+            EPOUT(USB_CDC_EP_BULK_OUT)->DOEPINT = USB_OTG_DOEPINT_XFRC;
+            gd32_oepint_bulk_count++;
+            enable_rx_endpoint(USB_CDC_EP_BULK_OUT);
+            gd32_notify_bulk_count++;
+            usb_notify_bulk_out();
+        }
+        if (daint & (1 << 16)) {
+            EPOUT(0)->DOEPINT = USB_OTG_DOEPINT_STUP | USB_OTG_DOEPINT_XFRC;
+            usb_notify_ep0();
+        }
+    }
+#endif
+#if CONFIG_STM32F4_GD32_USB_INIT_WORKAROUND
+    if (sts & USB_OTG_GINTSTS_USBRST) {
+        // Ack reset; enumeration completion handler rearms EP0 OUT.
+        OTG->GINTSTS = USB_OTG_GINTSTS_USBRST;
+    }
+    if (sts & USB_OTG_GINTSTS_ENUMDNE) {
+        // Ack enumeration done and reprogram turnaround time.
+        OTG->GINTSTS = USB_OTG_GINTSTS_ENUMDNE;
+        OTG->GUSBCFG = ((OTG->GUSBCFG & ~USB_OTG_GUSBCFG_TRDT)
+                        | (6 << USB_OTG_GUSBCFG_TRDT_Pos));
+        // Clear global IN/OUT NAK and rearm EP0 OUT to accept SETUP.
+        OTGD->DCTL = USB_OTG_DCTL_CGINAK;
+        OTGD->DCTL = USB_OTG_DCTL_CGONAK;
+        EPOUT(0)->DOEPTSIZ = (8 | (3 << USB_OTG_DOEPTSIZ_STUPCNT_Pos)
+                              | (1 << USB_OTG_DOEPTSIZ_PKTCNT_Pos));
+        EPOUT(0)->DOEPCTL |= USB_OTG_DOEPCTL_EPENA | USB_OTG_DOEPCTL_CNAK;
+    }
+#endif
+}
+
+// Initialize the usb controller
+void
+usb_init(void)
+{
+    // Enable USB clock
+#if CONFIG_MACH_STM32H7
+    if (READ_BIT(PWR->CR3, PWR_CR3_USB33RDY) != (PWR_CR3_USB33RDY)) {
+        SET_BIT(PWR->CR3, PWR_CR3_USB33DEN);
+    }
+    SET_BIT(RCC->AHB1ENR, USBOTGEN);
+#else
+    RCC->AHB2ENR |= RCC_AHB2ENR_OTGFSEN;
+#endif
+
+#if CONFIG_STM32F4_GD32_USB_INIT_WORKAROUND
+    // Restart GD32 USB PHY clock domain and reset the core state.
+    USB_PWRCLKCTL &= ~(USB_PWRCLKCTL_SHCLK | USB_PWRCLKCTL_SUCLK);
+    USB_PWRCLKCTL = 0;
+    usb_core_soft_reset();
+    *(volatile uint32_t *)(USB_PERIPH_BASE + USB_OTG_PCGCCTL_BASE) = 0;
+#else
+    while (!(OTG->GRSTCTL & USB_OTG_GRSTCTL_AHBIDL))
+        ;
+#endif
+
+    // Configure USB in full-speed device mode
+#if CONFIG_STM32F4_GD32_USB_INIT_WORKAROUND
+    // Preserve reserved bits for GD32 USBFS GUSBCS compatibility.
+    OTG->GUSBCFG = ((OTG->GUSBCFG
+                     & ~(USB_OTG_GUSBCFG_FDMOD | USB_OTG_GUSBCFG_FHMOD
+                         | USB_OTG_GUSBCFG_TRDT))
+                    | USB_OTG_GUSBCFG_FDMOD
+                    | (6 << USB_OTG_GUSBCFG_TRDT_Pos));
+    while (OTG->GINTSTS & USB_OTG_GINTSTS_CMOD)
+        ;
+#else
+    OTG->GUSBCFG = (USB_OTG_GUSBCFG_FDMOD | USB_OTG_GUSBCFG_PHYSEL
+                    | (6 << USB_OTG_GUSBCFG_TRDT_Pos));
+#endif
+    OTGD->DCFG |= (3 << USB_OTG_DCFG_DSPD_Pos);
+#if CONFIG_MACH_STM32F446 || CONFIG_MACH_STM32H7 || CONFIG_MACH_STM32F7
+    OTG->GOTGCTL = USB_OTG_GOTGCTL_BVALOEN | USB_OTG_GOTGCTL_BVALOVAL;
+#elif CONFIG_STM32F4_GD32_USB_INIT_WORKAROUND
+    // Use explicit GD32 session/power bits.
+    OTG->GCCFG = (USB_OTG_GCCFG_PWRDWN | USB_OTG_GCCFG_NOVBUSSENS
+                  | USB_OTG_GCCFG_VBUSASEN | USB_OTG_GCCFG_VBUSBSEN);
+    udelay(20000);
+#else
+    OTG->GCCFG |= USB_OTG_GCCFG_NOVBUSSENS;
+#endif
+
+    // Route pins
+    gpio_peripheral(GPIO_D_NEG, GPIO_FUNC, 0);
+    gpio_peripheral(GPIO_D_POS, GPIO_FUNC, 0);
+
+    // Setup USB packet memory
+    fifo_configure();
+#if CONFIG_STM32F4_GD32_USB_INIT_WORKAROUND
+    usb_core_runtime_reset();
+#endif
+
+    // Configure and enable ep0
+#if CONFIG_STM32F4_GD32_USB_INIT_WORKAROUND
+    // EP0 MPS encoding: 0 => 64 bytes.
+    uint32_t mpsize_ep0 = 0;
+#else
+    uint32_t mpsize_ep0 = 2;
+#endif
+    USB_OTG_INEndpointTypeDef *epi = EPIN(0);
+    USB_OTG_OUTEndpointTypeDef *epo = EPOUT(0);
+    epi->DIEPCTL = mpsize_ep0 | USB_OTG_DIEPCTL_SNAK;
+#if CONFIG_STM32F4_GD32_USB_INIT_WORKAROUND
+    epo->DOEPTSIZ = (64 | (3 << USB_OTG_DOEPTSIZ_STUPCNT_Pos)
+                     | (1 << USB_OTG_DOEPTSIZ_PKTCNT_Pos));
+#else
+    epo->DOEPTSIZ = (64 | (1 << USB_OTG_DOEPTSIZ_STUPCNT_Pos)
+                     | (1 << USB_OTG_DOEPTSIZ_PKTCNT_Pos));
+#endif
+    epo->DOEPCTL = mpsize_ep0 | USB_OTG_DOEPCTL_EPENA | USB_OTG_DOEPCTL_SNAK;
+
+    // Enable interrupts
+    OTGD->DIEPMSK = USB_OTG_DIEPMSK_XFRCM;
+    OTGD->DOEPMSK = USB_OTG_DOEPMSK_XFRCM | USB_OTG_DOEPMSK_STUPM;
+    OTGD->DAINTMSK = (1 << 16) | (1 << (16 + USB_CDC_EP_BULK_OUT));
+    OTG->GINTMSK = (USB_OTG_GINTMSK_RXFLVLM | USB_OTG_GINTMSK_IEPINT
+#if CONFIG_STM32F4_GD32_USB_INIT_WORKAROUND
+                    | USB_OTG_GINTMSK_OEPINT | USB_OTG_GINTMSK_USBRST
+                    | USB_OTG_GINTMSK_ENUMDNEM
+#endif
+                    );
+    OTG->GAHBCFG = USB_OTG_GAHBCFG_GINT;
+    armcm_enable_irq(OTG_FS_IRQHandler, OTG_IRQn, 1);
+
+    // Enable USB transceiver and connect.
+    OTG->GCCFG |= USB_OTG_GCCFG_PWRDWN;
+    OTGD->DCTL = 0;
+#if CONFIG_STM32F4_GD32_USB_INIT_WORKAROUND
+    // Ensure no global NAK state survives bootloader handoff.
+    OTGD->DCTL = USB_OTG_DCTL_CGINAK;
+    OTGD->DCTL = USB_OTG_DCTL_CGONAK;
+#endif
+}
+DECL_INIT(usb_init);
