@@ -28,3 +28,7 @@ This repository documents and hosts the patchset required for running mainline K
 
 - The flash scripts in `qidi_mcu_flash_scripts/` are intentionally simple examples.
 - Device paths (`/dev/serial/by-id/...`, `/dev/ttyS4`) are environment-specific and must be confirmed on your machine.
+
+## DISCLAIMER
+
+I am NOT responsible for anything that happens if you decide to install mainline Klipper onto your Qidi Q2. I will not provide any dedicated support. You do this at your own endeavour. This is merely a resource that I am providing on how I got mainline Klipper running on the stock hardware of the Qidi Q2. Also a little bit of a flex because many others tried before me but could never get the GD32F425 to successfully enumerate via USB nor get the CS1237 to function with Klipper.
