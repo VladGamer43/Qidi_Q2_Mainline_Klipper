@@ -15,8 +15,8 @@ Use the [qidi community Q2 wiki](https://github.com/qidi-community/q2-wiki) guid
 - [Update Debian package sources.](https://github.com/qidi-community/q2-wiki/blob/main/content/debian-package-sources/README.md)
 - [Update and fix KIAUH](https://github.com/qidi-community/q2-wiki/blob/main/content/kiauh-update-and-fix/README.md)
 - [Disable unused processes](https://github.com/bluedrool/Qidi-Q2-tuning-tweaks-and-mods/blob/main/docs/processes.md)
-- Remove the stock qidi Klipper installation with KIAUH.
-Note: you may need to delete or disable the klipper-mcu.service if its running on your system.
+- Remove the stock qidi Klipper, Moonraker,Fluidd and Crownest installation with KIAUH.
+Note: you may need to delete or disable the klipper-mcu.service if its running on your system and when deleting Qidi Klipper with KIAUH check for errors of not deleted files, for exaple "/klipper could not be deleted", then do "sudo rm -rf ~/<folder that didn't get deleted>".
 
 Before continuing, confirm:
 
@@ -46,7 +46,7 @@ git clone https://github.com/dw-0/kiauh.git
 
 ```bash
 sudo apt update
-sudo apt install -y git stlink-tools python3-serial
+sudo apt install -y -t bullseye-backports stlink-tools git python3-serial
 ```
 
 Notes:
@@ -85,8 +85,9 @@ Clone this guide repo to the host:
 
 ```bash
 cd ~
-git clone https://github.com/qidi-community/q2_mainline.git
-cd q2_mainline
+git clone https://github.com/MisterSheikh/Qidi_Q2_Mainline_Klipper.git
+cd Qidi_Q2_Mainline_Klipper
+
 ```
 
 Run the helper script:
@@ -112,7 +113,7 @@ If patch apply fails on latest upstream, checkout known-good commits and rerun `
 cd ~/klipper && git checkout 187481e2514f30fbaa19241869f4485ab4289cea
 cd ~/katapult && git checkout b0bf421069e2aab810db43d6e15f38817d981451
 
-cd ~/q2_mainline
+cd ~/Qidi_Q2_Mainline_Klipper
 ./apply_patch.sh
 ```
 
