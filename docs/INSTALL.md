@@ -15,8 +15,17 @@ Use the [qidi community Q2 wiki](https://github.com/qidi-community/q2-wiki) guid
 - [Update Debian package sources.](https://github.com/qidi-community/q2-wiki/blob/main/content/debian-package-sources/README.md)
 - [Update and fix KIAUH](https://github.com/qidi-community/q2-wiki/blob/main/content/kiauh-update-and-fix/README.md)
 - [Disable unused processes](https://github.com/bluedrool/Qidi-Q2-tuning-tweaks-and-mods/blob/main/docs/processes.md)
-- Remove the stock qidi Klipper, Moonraker,Fluidd and Crownest installation with KIAUH.
-Note: you may need to delete or disable the klipper-mcu.service if its running on your system and when deleting Qidi Klipper with KIAUH check for errors of not deleted files, for exaple "/klipper could not be deleted", then do "sudo rm -rf ~/<folder that didn't get deleted>".
+- Remove the stock qidi Klipper, Moonraker, Fluidd and Crowsnest installation with KIAUH.
+
+Note: You may need to delete or disable the `klipper-mcu.service` if it is running on your system. When deleting Qidi Klipper with KIAUH, check for errors about files that could not be deleted, for example `/klipper could not be deleted`. In that case, manually remove the folder:
+```bash
+sudo rm -rf ~/<folder that didn't get deleted>
+```
+
+Note: If KIAUH shows an error while uninstalling Crowsnest (e.g. `make: not found`), run the following command and retry:
+```bash
+sudo apt install -y make
+```
 
 Before continuing, confirm:
 
