@@ -251,8 +251,8 @@ index 9c9790ff7..edc3f3506 100644
      default y
  config WANT_TRIGGER_ANALOG
      bool
--    depends on WANT_HX71X || WANT_ADS1220 || WANT_LDC1612
-+    depends on WANT_HX71X || WANT_CS1237 || WANT_ADS1220 || WANT_LDC1612
+-    depends on WANT_ADC || WANT_HX71X || WANT_ADS1220 || WANT_LDC1612
++    depends on WANT_ADC || WANT_HX71X || WANT_CS1237 || WANT_ADS1220 || WANT_LDC1612
      default y
  config NEED_SOS_FILTER
      bool
