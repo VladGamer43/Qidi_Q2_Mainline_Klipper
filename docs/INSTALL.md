@@ -119,8 +119,8 @@ KLIPPER_DIR=/path/to/klipper KATAPULT_DIR=/path/to/katapult ./apply_patch.sh
 If patch apply fails on latest upstream, checkout known-good commits and rerun `./apply_patch.sh`:
 
 ```bash
-cd ~/klipper && git checkout 187481e2514f30fbaa19241869f4485ab4289cea
-cd ~/katapult && git checkout b0bf421069e2aab810db43d6e15f38817d981451
+cd ~/klipper && git checkout 88a71c3ce5383085b18d87d76ac42686ec7fad9f
+cd ~/katapult && git checkout 32584cbbb66c4dc85fc87c0fa87ed508f7c2df52
 
 cd ~/Qidi_Q2_Mainline_Klipper
 ./apply_patch.sh

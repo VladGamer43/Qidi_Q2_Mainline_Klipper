@@ -6,8 +6,8 @@ This page captures the pinned fallback revisions and config artifacts used for t
 
 If applying to latest upstream fails, use:
 
-- Klipper fallback commit: `187481e2514f30fbaa19241869f4485ab4289cea`
-- Katapult fallback commit: `b0bf421069e2aab810db43d6e15f38817d981451`
+- Klipper fallback commit: `88a71c3ce5383085b18d87d76ac42686ec7fad9f`
+- Katapult fallback commit: `32584cbbb66c4dc85fc87c0fa87ed508f7c2df52`
 
 ## Canonical patch files
 
