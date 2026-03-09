@@ -94,7 +94,7 @@ Clone this guide repo to the host:
 
 ```bash
 cd ~
-git clone https://github.com/MisterSheikh/Qidi_Q2_Mainline_Klipper.git
+git clone https://github.com/VladGamer43/Qidi_Q2_Mainline_Klipper.git
 cd Qidi_Q2_Mainline_Klipper
 
 ```
